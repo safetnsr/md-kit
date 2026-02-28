@@ -3,11 +3,13 @@
 import { resolve, join } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, chmodSync, watch } from 'node:fs';
 import { findMarkdownFiles, extractLinks, readFile } from './core/scanner.js';
-import { findBrokenLinks, BrokenLink } from './core/resolver.js';
-import { formatTable, formatJson } from './core/reporter.js';
+import { findBrokenLinks, countIgnored, BrokenLink } from './core/resolver.js';
+import { formatTable, formatJson, DisplayLevel } from './core/reporter.js';
 import { moveFile } from './core/mover.js';
+import { addIgnorePattern } from './core/ignore.js';
+import { getLastModified, parseSinceDate } from './core/severity.js';
 
-const VERSION = '0.4.1';
+const VERSION = '0.5.0';
 
 const HELP = `
 md-kit — find broken [[wikilinks]] and dead relative links in any markdown workspace
@@ -20,6 +22,7 @@ USAGE
   md-kit mv <old> <new>         move file and update all incoming links
   md-kit mv <old> <new> --dry-run  preview without moving
   md-kit watch [dir]            watch for changes and alert on broken links
+  md-kit ignore <link>          add link to .mdkitignore
   md-kit install                install pre-commit git hook
   md-kit setup                  auto-configure for agent workspace
 
@@ -31,6 +34,11 @@ FLAGS
   --dry-run                (mv only) preview without moving
   --quiet-if-clean         (check only) no output if no broken links found
   --git-alias              (setup only) install git mmd alias
+  --full                   (check only) show all severity levels
+  --critical               (check only) show only critical items (default)
+  --warnings               (check only) show critical + warning items
+  --since <date>           (check only) only files modified after date
+                           formats: YYYY-MM-DD, yesterday, 7days
 `;
 
 export interface ParsedArgs {
@@ -46,6 +54,10 @@ export interface ParsedArgs {
   quietIfClean: boolean;
   gitAlias: boolean;
   positionals: string[];
+  full: boolean;
+  critical: boolean;
+  warnings: boolean;
+  since: string | null;
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -61,6 +73,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
   let dryRun = false;
   let quietIfClean = false;
   let gitAlias = false;
+  let full = false;
+  let critical = false;
+  let warnings = false;
+  let since: string | null = null;
   const positionals: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -81,25 +97,27 @@ export function parseArgs(argv: string[]): ParsedArgs {
       quietIfClean = true;
     } else if (arg === '--git-alias') {
       gitAlias = true;
+    } else if (arg === '--full') {
+      full = true;
+    } else if (arg === '--critical') {
+      critical = true;
+    } else if (arg === '--warnings') {
+      warnings = true;
+    } else if (arg === '--since' && i + 1 < args.length) {
+      since = args[++i];
     } else if (arg === '--ignore' && i + 1 < args.length) {
       ignore.push(args[++i]);
     } else if (!command && !arg.startsWith('-')) {
       command = arg;
     } else if (command && !arg.startsWith('-')) {
       positionals.push(arg);
-      if (command !== 'mv') {
+      if (command !== 'mv' && command !== 'ignore') {
         dir = arg;
       }
     }
   }
 
-  // For mv command, positionals are [old, new]
-  // For other commands, first positional is dir
-  if (command === 'mv') {
-    // dir not used for mv
-  }
-
-  return { command, dir, json, ignore, help, version, apply, patch, dryRun, quietIfClean, gitAlias, positionals };
+  return { command, dir, json, ignore, help, version, apply, patch, dryRun, quietIfClean, gitAlias, positionals, full, critical, warnings, since };
 }
 
 /**
@@ -109,6 +127,7 @@ function runCheck(baseDir: string, opts: { ignore: string[] }): {
   files: string[];
   allLinks: ReturnType<typeof extractLinks>;
   broken: BrokenLink[];
+  ignoredCount: number;
 } {
   const files = findMarkdownFiles(baseDir);
   const allLinks: ReturnType<typeof extractLinks> = [];
@@ -126,8 +145,9 @@ function runCheck(baseDir: string, opts: { ignore: string[] }): {
     });
   }
 
+  const ignoredCount = countIgnored(filteredLinks, baseDir);
   const broken = findBrokenLinks(filteredLinks, files, baseDir);
-  return { files, allLinks: filteredLinks, broken };
+  return { files, allLinks: filteredLinks, broken, ignoredCount };
 }
 
 /**
@@ -348,6 +368,21 @@ function cmdMv(opts: ParsedArgs): number {
 }
 
 /**
+ * ignore command — add link to .mdkitignore
+ */
+function cmdIgnore(opts: ParsedArgs): number {
+  if (opts.positionals.length < 1) {
+    process.stderr.write('Usage: md-kit ignore <link>\n');
+    return 1;
+  }
+  const link = opts.positionals[0];
+  const baseDir = resolve(opts.dir);
+  addIgnorePattern(link, baseDir);
+  process.stdout.write(`added [[${link}]] to .mdkitignore\n`);
+  return 0;
+}
+
+/**
  * Install git mmd alias — returns true if installed, false if skipped
  */
 export function installGitAlias(): boolean {
@@ -419,7 +454,7 @@ function cmdSetup(opts?: ParsedArgs): number {
       // Count existing ### N. headers
       const stepMatches = content.match(/### \d+\./g);
       const nextN = stepMatches ? stepMatches.length + 1 : 1;
-      const newStep = `\n### ${nextN}. md-kit check\n- Run \`npx @safetnsr/md-kit check . --json --quiet-if-clean\` — if \`broken_count > 0\`, report broken links to pablo\n`;
+      const newStep = `\n### ${nextN}. md-kit check\n- Run \`npx @safetnsr/md-kit check . --json --quiet-if-clean --since yesterday\` — if \`critical > 0\`, report broken links to pablo\n`;
       appendFileSync(heartbeatPath, newStep);
       heartbeatUpdated = true;
     }
@@ -486,7 +521,7 @@ function cmdWatch(opts: ParsedArgs): number {
 
       if (broken.length > 0) {
         if (opts.json) {
-          const report = { timestamp: now, ...require('./core/reporter.js').formatJson(broken, files.length, allLinks.length) };
+          const report = { timestamp: now, ...formatJson(broken, files.length, allLinks.length) };
           process.stdout.write(JSON.stringify(report) + '\n');
         } else {
           process.stdout.write(`[${now}] ${broken.length} broken links found:\n`);
@@ -575,6 +610,10 @@ export function main(argv: string[] = process.argv): number {
     return cmdSetup(opts);
   }
 
+  if (opts.command === 'ignore') {
+    return cmdIgnore(opts);
+  }
+
   if (opts.gitAlias) {
     installGitAlias();
   }
@@ -597,11 +636,22 @@ export function main(argv: string[] = process.argv): number {
   }
 
   const baseDir = resolve(opts.dir);
-  const { files, allLinks, broken } = runCheck(baseDir, opts);
+  const { files, allLinks, broken, ignoredCount } = runCheck(baseDir, opts);
+
+  // Apply --since filter
+  let filteredBroken = broken;
+  if (opts.since) {
+    const sinceDate = parseSinceDate(opts.since);
+    filteredBroken = broken.filter(b => {
+      const lastMod = getLastModified(b.file, baseDir);
+      if (!lastMod) return false; // untracked files excluded when --since is used
+      return lastMod >= sinceDate;
+    });
+  }
 
   if (files.length === 0) {
     if (opts.json) {
-      process.stdout.write(JSON.stringify({ totalFiles: 0, totalLinks: 0, brokenLinks: 0, results: [] }, null, 2) + '\n');
+      process.stdout.write(JSON.stringify({ totalFiles: 0, totalLinks: 0, brokenLinks: 0, broken_count: 0, critical: 0, warnings: 0, info: 0, ignored_count: 0, results: [] }, null, 2) + '\n');
     } else if (!opts.quietIfClean) {
       process.stdout.write('No markdown files found.\n');
     }
@@ -609,27 +659,31 @@ export function main(argv: string[] = process.argv): number {
   }
 
   // quiet-if-clean: no output when no broken links
-  if (opts.quietIfClean && broken.length === 0) {
+  if (opts.quietIfClean && filteredBroken.length === 0) {
     return 0;
   }
 
+  // Determine display level
+  let displayLevel: DisplayLevel = 'critical';
+  if (opts.full) displayLevel = 'full';
+  else if (opts.warnings) displayLevel = 'warnings';
+
   // Output
   if (opts.json) {
-    const report: any = formatJson(broken, files.length, allLinks.length);
-    if (broken.length > 0) {
-      report.broken_count = broken.length;
-      report.tip = 'use `md-kit mv <old> <new>` to move files without breaking links';
+    const report = formatJson(filteredBroken, files.length, allLinks.length, ignoredCount);
+    if (filteredBroken.length > 0) {
+      (report as any).tip = 'use `md-kit mv <old> <new>` to move files without breaking links';
     }
     process.stdout.write(JSON.stringify(report, null, 2) + '\n');
   } else {
-    const output = formatTable(broken, files.length, allLinks.length);
+    const output = formatTable(filteredBroken, files.length, allLinks.length, displayLevel);
     process.stdout.write(output + '\n');
-    if (broken.length > 0 && !opts.quietIfClean) {
+    if (filteredBroken.length > 0 && !opts.quietIfClean) {
       process.stdout.write('tip: use `md-kit mv <old> <new>` instead of mv/git mv to auto-update links\n');
     }
   }
 
-  return broken.length > 0 ? 1 : 0;
+  return filteredBroken.length > 0 ? 1 : 0;
 }
 
 // Run

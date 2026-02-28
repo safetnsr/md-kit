@@ -1,9 +1,12 @@
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { ExtractedLink } from './scanner.js';
+import { Severity, getSeverity } from './severity.js';
+import { loadIgnorePatterns, isIgnored } from './ignore.js';
 
 export interface BrokenLink extends ExtractedLink {
   suggestion: string | null;
+  severity: Severity;
 }
 
 /**
@@ -82,7 +85,9 @@ function resolveRelativeLink(target: string, fromFile: string, baseDir: string):
 }
 
 /**
- * Check all extracted links, return broken ones with suggestions
+ * Check all extracted links, return broken ones with suggestions.
+ * Loads .mdkitignore patterns and skips matching links.
+ * Returns { broken, ignoredCount }.
  */
 export function findBrokenLinks(
   links: ExtractedLink[],
@@ -90,8 +95,14 @@ export function findBrokenLinks(
   baseDir: string
 ): BrokenLink[] {
   const broken: BrokenLink[] = [];
+  const ignorePatterns = loadIgnorePatterns(baseDir);
 
   for (const link of links) {
+    // Skip ignored links
+    if (isIgnored(link.target, ignorePatterns)) {
+      continue;
+    }
+
     let isValid = false;
 
     if (link.type === 'wikilink') {
@@ -104,9 +115,22 @@ export function findBrokenLinks(
       broken.push({
         ...link,
         suggestion: findSuggestion(link.target, allFiles),
+        severity: getSeverity(link.file, baseDir),
       });
     }
   }
 
   return broken;
+}
+
+/**
+ * Count how many links were ignored by .mdkitignore patterns.
+ */
+export function countIgnored(
+  links: ExtractedLink[],
+  baseDir: string
+): number {
+  const ignorePatterns = loadIgnorePatterns(baseDir);
+  if (ignorePatterns.length === 0) return 0;
+  return links.filter(link => isIgnored(link.target, ignorePatterns)).length;
 }

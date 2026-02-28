@@ -36,7 +36,7 @@ describe('CLI', () => {
   it('--version shows version', () => {
     const { stdout, exitCode } = run('--version');
     assert.equal(exitCode, 0);
-    assert.ok(stdout.includes('0.4.1'));
+    assert.ok(stdout.includes('0.5.0'));
   });
 
   it('check with no broken links exits 0', () => {

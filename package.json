@@ -1,6 +1,6 @@
 {
   "name": "@safetnsr/md-kit",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "find broken [[wikilinks]] and dead relative links in any markdown workspace",
   "main": "./dist/cli.js",
   "bin": {
