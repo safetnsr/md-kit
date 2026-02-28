@@ -1,0 +1,43 @@
+{
+  "name": "@safetnsr/md-kit",
+  "version": "0.1.0",
+  "description": "find broken [[wikilinks]] and dead relative links in any markdown workspace",
+  "main": "./dist/cli.js",
+  "bin": {
+    "md-kit": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:test": "tsc -p tsconfig.test.json",
+    "test": "npm run build:test && node --test build/tests/*.test.js",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "markdown",
+    "wikilinks",
+    "broken-links",
+    "cli",
+    "ai",
+    "agents",
+    "lint"
+  ],
+  "author": "safetnsr",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/safetnsr/md-kit.git"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
