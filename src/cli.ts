@@ -5,23 +5,30 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, chm
 import { findMarkdownFiles, extractLinks, readFile } from './core/scanner.js';
 import { findBrokenLinks, BrokenLink } from './core/resolver.js';
 import { formatTable, formatJson } from './core/reporter.js';
+import { moveFile } from './core/mover.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 const HELP = `
 md-kit — find broken [[wikilinks]] and dead relative links in any markdown workspace
 
 USAGE
-  md-kit check [dir]       scan for broken links (default: .)
-  md-kit fix [dir]         auto-fix broken links (dry-run by default)
-  md-kit fix [dir] --apply actually write fixes
-  md-kit watch [dir]       watch for changes and alert on broken links
-  md-kit install           install pre-commit git hook
+  md-kit check [dir]            scan for broken links (default: .)
+  md-kit fix [dir]              show fixable broken links (dry-run)
+  md-kit fix [dir] --apply      write fixes to files
+  md-kit fix [dir] --patch      write fixes to md-kit-fixes.md for review
+  md-kit mv <old> <new>         move file and update all incoming links
+  md-kit mv <old> <new> --dry-run  preview without moving
+  md-kit watch [dir]            watch for changes and alert on broken links
+  md-kit install                install pre-commit git hook
+  md-kit setup                  auto-configure for agent workspace
 
 FLAGS
   --json                   output as JSON (agent interface)
   --ignore <pattern>       glob pattern to ignore (repeatable)
   --apply                  (fix only) apply fixes to files
+  --patch                  (fix only) write fixes to md-kit-fixes.md
+  --dry-run                (mv only) preview without moving
   --quiet-if-clean         (check only) no output if no broken links found
 `;
 
@@ -33,7 +40,10 @@ export interface ParsedArgs {
   help: boolean;
   version: boolean;
   apply: boolean;
+  patch: boolean;
+  dryRun: boolean;
   quietIfClean: boolean;
+  positionals: string[];
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -45,7 +55,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
   let help = false;
   let version = false;
   let apply = false;
+  let patch = false;
+  let dryRun = false;
   let quietIfClean = false;
+  const positionals: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -57,6 +70,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
       json = true;
     } else if (arg === '--apply') {
       apply = true;
+    } else if (arg === '--patch') {
+      patch = true;
+    } else if (arg === '--dry-run') {
+      dryRun = true;
     } else if (arg === '--quiet-if-clean') {
       quietIfClean = true;
     } else if (arg === '--ignore' && i + 1 < args.length) {
@@ -64,11 +81,20 @@ export function parseArgs(argv: string[]): ParsedArgs {
     } else if (!command && !arg.startsWith('-')) {
       command = arg;
     } else if (command && !arg.startsWith('-')) {
-      dir = arg;
+      positionals.push(arg);
+      if (command !== 'mv') {
+        dir = arg;
+      }
     }
   }
 
-  return { command, dir, json, ignore, help, version, apply, quietIfClean };
+  // For mv command, positionals are [old, new]
+  // For other commands, first positional is dir
+  if (command === 'mv') {
+    // dir not used for mv
+  }
+
+  return { command, dir, json, ignore, help, version, apply, patch, dryRun, quietIfClean, positionals };
 }
 
 /**
@@ -151,6 +177,47 @@ function cmdFix(opts: ParsedArgs): number {
   const fixable = broken.filter(b => b.suggestion !== null);
   const skipped = broken.filter(b => b.suggestion === null);
 
+  // --patch mode: write md-kit-fixes.md
+  if (opts.patch) {
+    if (fixable.length === 0 && skipped.length === 0) {
+      process.stdout.write('no broken links found\n');
+      return 0;
+    }
+
+    const now = new Date().toISOString().slice(0, 10);
+    const lines: string[] = [
+      '# md-kit fixes',
+      `generated: ${now}`,
+      '',
+      '## pending fixes (run `md-kit fix . --apply` to apply all)',
+      '',
+    ];
+
+    for (const b of [...fixable, ...skipped]) {
+      const newRaw = b.suggestion
+        ? (b.type === 'wikilink'
+            ? b.raw.replace(b.target, b.suggestion)
+            : b.raw.replace(b.target, b.suggestion + (b.target.endsWith('.md') ? '.md' : '')))
+        : null;
+
+      lines.push(`### ${b.file}:${b.line}`);
+      lines.push(`- broken: \`${b.raw}\``);
+      if (newRaw) {
+        lines.push(`- suggestion: \`${newRaw}\``);
+        lines.push('- fix: replace with suggestion');
+      } else {
+        lines.push('- suggestion: none');
+        lines.push('- fix: manual review needed');
+      }
+      lines.push('');
+    }
+
+    const patchPath = join(baseDir, 'md-kit-fixes.md');
+    writeFileSync(patchPath, lines.join('\n'));
+    process.stdout.write('wrote md-kit-fixes.md — review and run `md-kit fix . --apply` to apply\n');
+    return fixable.length > 0 || skipped.length > 0 ? 1 : 0;
+  }
+
   if (opts.json) {
     const result = {
       fixed: fixable.map(b => ({
@@ -210,6 +277,107 @@ function cmdFix(opts: ParsedArgs): number {
   }
 
   return 1;
+}
+
+/**
+ * mv command — move file and update all incoming links
+ */
+function cmdMv(opts: ParsedArgs): number {
+  if (opts.positionals.length < 2) {
+    process.stderr.write('Usage: md-kit mv <old-path> <new-path> [--dry-run] [--json]\n');
+    return 1;
+  }
+
+  const oldPath = opts.positionals[0];
+  const newPath = opts.positionals[1];
+  const baseDir = process.cwd();
+
+  try {
+    const result = moveFile(baseDir, oldPath, newPath, { dryRun: opts.dryRun, json: opts.json });
+
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({
+        moved: result.moved,
+        old: result.old,
+        new: result.new,
+        links_updated: result.links_updated,
+        files_updated: result.files_updated,
+        dry_run: opts.dryRun,
+      }, null, 2) + '\n');
+    } else {
+      const verb = opts.dryRun ? 'would move' : 'moved';
+      process.stdout.write(`${verb}: ${result.old} → ${result.new}\n`);
+      if (result.updates.length > 0) {
+        const verb2 = opts.dryRun ? 'would update' : 'updated';
+        process.stdout.write(`${verb2} ${result.links_updated} links in ${result.files_updated.length} files:\n`);
+        for (const u of result.updates) {
+          process.stdout.write(`  ${u.file}:${u.line}\t${u.oldRaw} → ${u.newRaw}\n`);
+        }
+      }
+    }
+
+    return 0;
+  } catch (e: any) {
+    process.stderr.write(`Error: ${e.message}\n`);
+    return 1;
+  }
+}
+
+/**
+ * setup command — auto-configure for agent workspace
+ */
+function cmdSetup(): number {
+  const cwd = process.cwd();
+  const markers = ['AGENTS.md', 'CLAUDE.md', 'HEARTBEAT.md', '.claude', '.openclaw'];
+  const found = markers.some(m => existsSync(join(cwd, m)));
+
+  if (!found) {
+    process.stdout.write('no agent workspace detected (no AGENTS.md/CLAUDE.md/HEARTBEAT.md found)\n');
+    return 0;
+  }
+
+  // Install hook (skip if already installed)
+  const gitDir = join(cwd, '.git');
+  let hookInstalled = false;
+  if (existsSync(gitDir)) {
+    const hookPath = join(gitDir, 'hooks', 'pre-commit');
+    if (existsSync(hookPath)) {
+      const hookContent = readFileSync(hookPath, 'utf-8');
+      if (hookContent.includes('md-kit')) {
+        // Already installed
+      } else {
+        cmdInstall();
+        hookInstalled = true;
+      }
+    } else {
+      cmdInstall();
+      hookInstalled = true;
+    }
+  }
+
+  // Update HEARTBEAT.md if it exists
+  let heartbeatUpdated = false;
+  const heartbeatPath = join(cwd, 'HEARTBEAT.md');
+  if (existsSync(heartbeatPath)) {
+    const content = readFileSync(heartbeatPath, 'utf-8');
+    if (content.includes('md-kit check')) {
+      // Already has md-kit check
+    } else {
+      // Count existing ### N. headers
+      const stepMatches = content.match(/### \d+\./g);
+      const nextN = stepMatches ? stepMatches.length + 1 : 1;
+      const newStep = `\n### ${nextN}. md-kit check\n- Run \`npx @safetnsr/md-kit check . --json --quiet-if-clean\` — if \`broken_count > 0\`, report broken links to pablo\n`;
+      appendFileSync(heartbeatPath, newStep);
+      heartbeatUpdated = true;
+    }
+  }
+
+  const parts: string[] = [];
+  if (hookInstalled) parts.push('hook installed');
+  if (heartbeatUpdated) parts.push('heartbeat updated');
+  if (parts.length === 0) parts.push('already configured');
+  process.stdout.write(`md-kit setup complete: ${parts.join(', ')}\n`);
+  return 0;
 }
 
 /**
@@ -307,6 +475,14 @@ export function main(argv: string[] = process.argv): number {
 
   if (opts.command === 'install') {
     return cmdInstall();
+  }
+
+  if (opts.command === 'setup') {
+    return cmdSetup();
+  }
+
+  if (opts.command === 'mv') {
+    return cmdMv(opts);
   }
 
   if (opts.command === 'fix') {
