@@ -7,7 +7,7 @@ import { findBrokenLinks, BrokenLink } from './core/resolver.js';
 import { formatTable, formatJson } from './core/reporter.js';
 import { moveFile } from './core/mover.js';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 
 const HELP = `
 md-kit — find broken [[wikilinks]] and dead relative links in any markdown workspace
@@ -30,6 +30,7 @@ FLAGS
   --patch                  (fix only) write fixes to md-kit-fixes.md
   --dry-run                (mv only) preview without moving
   --quiet-if-clean         (check only) no output if no broken links found
+  --git-alias              (setup only) install git mmd alias
 `;
 
 export interface ParsedArgs {
@@ -43,6 +44,7 @@ export interface ParsedArgs {
   patch: boolean;
   dryRun: boolean;
   quietIfClean: boolean;
+  gitAlias: boolean;
   positionals: string[];
 }
 
@@ -58,6 +60,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   let patch = false;
   let dryRun = false;
   let quietIfClean = false;
+  let gitAlias = false;
   const positionals: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -76,6 +79,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
       dryRun = true;
     } else if (arg === '--quiet-if-clean') {
       quietIfClean = true;
+    } else if (arg === '--git-alias') {
+      gitAlias = true;
     } else if (arg === '--ignore' && i + 1 < args.length) {
       ignore.push(args[++i]);
     } else if (!command && !arg.startsWith('-')) {
@@ -94,7 +99,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     // dir not used for mv
   }
 
-  return { command, dir, json, ignore, help, version, apply, patch, dryRun, quietIfClean, positionals };
+  return { command, dir, json, ignore, help, version, apply, patch, dryRun, quietIfClean, gitAlias, positionals };
 }
 
 /**
@@ -144,11 +149,30 @@ function cmdInstall(): number {
   const hookPath = join(hooksDir, 'pre-commit');
 
   const hookContent = `#!/bin/sh
-# md-kit pre-commit hook — checks for broken wikilinks on md file changes
+# md-kit pre-commit hook
 CHANGED=$(git diff --cached --name-only --diff-filter=ADMR | grep '\\.md$')
 if [ -n "$CHANGED" ]; then
-  npx @safetnsr/md-kit check . --quiet-if-clean
-  exit $?
+  OUTPUT=$(npx @safetnsr/md-kit check . --json --quiet-if-clean 2>/dev/null)
+  if [ -z "$OUTPUT" ]; then
+    exit 0
+  fi
+  BROKEN=$(echo "$OUTPUT" | node -e "process.stdin.resume();let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);process.stdout.write(String(j.broken_count||0))}catch{process.stdout.write('0')}})")
+  if [ "$BROKEN" = "0" ]; then
+    exit 0
+  fi
+  echo ""
+  echo "md-kit: $BROKEN broken link(s) found"
+  npx @safetnsr/md-kit check . 2>/dev/null
+  echo ""
+  printf "fix broken links automatically? [Y/n] "
+  read REPLY </dev/tty
+  if [ "$REPLY" = "n" ] || [ "$REPLY" = "N" ]; then
+    echo "commit blocked. fix links manually or run: md-kit fix . --apply"
+    exit 1
+  fi
+  npx @safetnsr/md-kit fix . --apply 2>/dev/null
+  git add -A
+  echo "links fixed. continuing commit."
 fi
 exit 0
 `;
@@ -324,9 +348,34 @@ function cmdMv(opts: ParsedArgs): number {
 }
 
 /**
+ * Install git mmd alias — returns true if installed, false if skipped
+ */
+export function installGitAlias(): boolean {
+  try {
+    const { execSync } = require('node:child_process');
+    // Check if git is available
+    execSync('git config --list', { stdio: 'pipe' });
+    // Check if alias already exists
+    try {
+      const existing = execSync('git config alias.mmd', { encoding: 'utf-8', stdio: 'pipe' }).trim();
+      if (existing) {
+        return false; // already exists
+      }
+    } catch {
+      // alias doesn't exist, install it
+    }
+    execSync(`git config alias.mmd '!f() { npx @safetnsr/md-kit mv "$1" "$2" && git add -A; }; f'`, { stdio: 'pipe' });
+    process.stdout.write('installed git alias: use `git mmd <old> <new>` to move files with link updates\n');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * setup command — auto-configure for agent workspace
  */
-function cmdSetup(): number {
+function cmdSetup(opts?: ParsedArgs): number {
   const cwd = process.cwd();
   const markers = ['AGENTS.md', 'CLAUDE.md', 'HEARTBEAT.md', '.claude', '.openclaw'];
   const found = markers.some(m => existsSync(join(cwd, m)));
@@ -355,6 +404,10 @@ function cmdSetup(): number {
     }
   }
 
+  // Install git alias
+  let aliasInstalled = false;
+  aliasInstalled = installGitAlias();
+
   // Update HEARTBEAT.md if it exists
   let heartbeatUpdated = false;
   const heartbeatPath = join(cwd, 'HEARTBEAT.md');
@@ -374,6 +427,7 @@ function cmdSetup(): number {
 
   const parts: string[] = [];
   if (hookInstalled) parts.push('hook installed');
+  if (aliasInstalled) parts.push('git alias installed');
   if (heartbeatUpdated) parts.push('heartbeat updated');
   if (parts.length === 0) parts.push('already configured');
   process.stdout.write(`md-kit setup complete: ${parts.join(', ')}\n`);
@@ -413,13 +467,15 @@ function applyFixes(baseDir: string, fixable: BrokenLink[]): number {
 }
 
 /**
- * watch command — filesystem daemon
+ * watch command — filesystem daemon with rename detection + auto-fix
  */
 function cmdWatch(opts: ParsedArgs): number {
   const baseDir = resolve(opts.dir);
   process.stdout.write(`watching ${opts.dir} for markdown changes... (Ctrl+C to stop)\n`);
+  process.stdout.write(`tip: use \`md-kit mv\` or \`git mmd\` instead of mv/git mv to auto-update links\n`);
 
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let renameDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let lastBrokenCount = -1;
 
   function onchange() {
@@ -446,10 +502,48 @@ function cmdWatch(opts: ParsedArgs): number {
     }, 500);
   }
 
+  function onRename() {
+    if (renameDebounceTimer) clearTimeout(renameDebounceTimer);
+    renameDebounceTimer = setTimeout(() => {
+      const now = new Date().toISOString().slice(11, 19);
+      process.stdout.write(`[${now}] rename detected — checking links...\n`);
+
+      const { files, allLinks, broken } = runCheck(baseDir, opts);
+      if (broken.length === 0) return;
+
+      // Auto-fix links with exactly one suggestion
+      const singleSuggestion = broken.filter(b => b.suggestion !== null);
+      if (singleSuggestion.length > 0) {
+        const fixed = applyFixes(baseDir, singleSuggestion);
+        for (const b of singleSuggestion) {
+          const newRaw = b.type === 'wikilink'
+            ? b.raw.replace(b.target, b.suggestion!)
+            : b.raw.replace(b.target, b.suggestion! + (b.target.endsWith('.md') ? '.md' : ''));
+          process.stdout.write(`[${now}] auto-fixed: ${b.raw} → ${newRaw} in ${b.file}:${b.line}\n`);
+        }
+        lastBrokenCount = 0;
+      }
+
+      // Report remaining unfixable
+      const noSuggestion = broken.filter(b => b.suggestion === null);
+      if (noSuggestion.length > 0) {
+        process.stdout.write(`[${now}] ${noSuggestion.length} broken links need manual fix:\n`);
+        for (const b of noSuggestion) {
+          process.stdout.write(`  ${b.file}:${b.line}  ${b.raw}\n`);
+        }
+        lastBrokenCount = noSuggestion.length;
+      }
+    }, 500);
+  }
+
   try {
     watch(baseDir, { recursive: true }, (event, filename) => {
       if (filename && filename.endsWith('.md')) {
-        onchange();
+        if (event === 'rename') {
+          onRename();
+        } else {
+          onchange();
+        }
       }
     });
   } catch (e: any) {
@@ -478,7 +572,11 @@ export function main(argv: string[] = process.argv): number {
   }
 
   if (opts.command === 'setup') {
-    return cmdSetup();
+    return cmdSetup(opts);
+  }
+
+  if (opts.gitAlias) {
+    installGitAlias();
   }
 
   if (opts.command === 'mv') {
@@ -517,11 +615,18 @@ export function main(argv: string[] = process.argv): number {
 
   // Output
   if (opts.json) {
-    const report = formatJson(broken, files.length, allLinks.length);
+    const report: any = formatJson(broken, files.length, allLinks.length);
+    if (broken.length > 0) {
+      report.broken_count = broken.length;
+      report.tip = 'use `md-kit mv <old> <new>` to move files without breaking links';
+    }
     process.stdout.write(JSON.stringify(report, null, 2) + '\n');
   } else {
     const output = formatTable(broken, files.length, allLinks.length);
     process.stdout.write(output + '\n');
+    if (broken.length > 0 && !opts.quietIfClean) {
+      process.stdout.write('tip: use `md-kit mv <old> <new>` instead of mv/git mv to auto-update links\n');
+    }
   }
 
   return broken.length > 0 ? 1 : 0;
