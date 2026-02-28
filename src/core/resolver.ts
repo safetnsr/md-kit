@@ -54,13 +54,22 @@ function findSuggestion(target: string, allFiles: string[]): string | null {
 /**
  * Resolve a wikilink against the list of known .md files
  */
-function resolveWikilink(target: string, allFiles: string[]): boolean {
-  const targetLower = target.toLowerCase();
-  return allFiles.some(f => {
+function resolveWikilink(target: string, allFiles: string[], baseDir: string): boolean {
+  // strip trailing slash — directory references like [[comrade/]] are valid
+  const cleanTarget = target.replace(/\/$/, '');
+  const targetLower = cleanTarget.toLowerCase();
+
+  // check against known .md files
+  const matchesFile = allFiles.some(f => {
     const baseName = f.replace(/\.md$/, '');
     const baseNameOnly = baseName.split('/').pop() ?? baseName;
     return baseNameOnly.toLowerCase() === targetLower || baseName.toLowerCase() === targetLower;
   });
+  if (matchesFile) return true;
+
+  // check if it's a valid directory in the workspace
+  const dirPath = join(baseDir, cleanTarget);
+  return existsSync(dirPath);
 }
 
 /**
@@ -86,7 +95,7 @@ export function findBrokenLinks(
     let isValid = false;
 
     if (link.type === 'wikilink') {
-      isValid = resolveWikilink(link.target, allFiles);
+      isValid = resolveWikilink(link.target, allFiles, baseDir);
     } else {
       isValid = resolveRelativeLink(link.target, link.file, baseDir);
     }

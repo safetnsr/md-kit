@@ -7,7 +7,7 @@ import { findBrokenLinks, BrokenLink } from './core/resolver.js';
 import { formatTable, formatJson } from './core/reporter.js';
 import { moveFile } from './core/mover.js';
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 
 const HELP = `
 md-kit — find broken [[wikilinks]] and dead relative links in any markdown workspace
