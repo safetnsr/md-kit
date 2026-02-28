@@ -1,1 +1,4 @@
-node_modules/\ndist/\nbuild/\n.test-tmp-*
+node_modules/
+dist/
+build/
+.test-tmp-*
