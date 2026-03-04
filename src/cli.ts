@@ -8,8 +8,14 @@ import { formatTable, formatJson, DisplayLevel } from './core/reporter.js';
 import { moveFile } from './core/mover.js';
 import { addIgnorePattern } from './core/ignore.js';
 import { getLastModified, parseSinceDate } from './core/severity.js';
+import { findConfigFile, loadConfig, generateDefaultConfig } from './pipe/config.js';
+import { MdPipeWatcher } from './pipe/watcher.js';
+import { runOnce } from './pipe/once.js';
+import { testFile } from './pipe/test-file.js';
+import { runPipelineCommand } from './pipe/run-command.js';
+import type { PipelineResult } from './pipe/pipeline.js';
 
-const VERSION = '0.5.0';
+const VERSION = '0.2.0';
 
 const HELP = `
 md-kit — find broken [[wikilinks]] and dead relative links in any markdown workspace
@@ -25,6 +31,11 @@ USAGE
   md-kit ignore <link>          add link to .mdkitignore
   md-kit install                install pre-commit git hook
   md-kit setup                  auto-configure for agent workspace
+  md-kit pipe init              scaffold a .md-pipe.yml config file
+  md-kit pipe watch             watch directory and run pipelines on file changes
+  md-kit pipe once              run triggers/pipelines against current files (CI/batch)
+  md-kit pipe run <pipeline>    manually run a pipeline on matching files
+  md-kit pipe test <file>       show which triggers/pipelines match a file
 
 FLAGS
   --json                   output as JSON (agent interface)
@@ -589,6 +600,268 @@ function cmdWatch(opts: ParsedArgs): number {
   return 0;
 }
 
+/**
+ * pipe command — md-pipe functionality (watch + pipeline automation)
+ * Subcommands: init, watch, once, run, test
+ */
+async function cmdPipe(subArgs: string[]): Promise<number> {
+  const sub = subArgs[0] || 'help';
+  const rest = subArgs.slice(1);
+
+  // Parse common pipe flags
+  let configPath: string | undefined;
+  let dryRun = false;
+  let json = false;
+  let verbose = false;
+  let debug = false;
+  let statePath: string | undefined;
+  const positionals: string[] = [];
+
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--dry-run') { dryRun = true; }
+    else if (a === '--json') { json = true; }
+    else if (a === '--verbose') { verbose = true; }
+    else if (a === '--debug') { debug = true; }
+    else if ((a === '--config' || a === '-c') && i + 1 < rest.length) { configPath = rest[++i]; }
+    else if (a === '--state' && i + 1 < rest.length) { statePath = rest[++i]; }
+    else if (!a.startsWith('-')) { positionals.push(a); }
+  }
+
+  function getConfig() {
+    const cwd = process.cwd();
+    const cfgPath = configPath || findConfigFile(cwd);
+    if (!cfgPath) {
+      process.stderr.write('No .md-pipe.yml found. Run `md-kit pipe init` to create one.\n');
+      process.exit(1);
+    }
+    return loadConfig(cfgPath);
+  }
+
+  function formatCmd(command: string): string {
+    if (debug) return command;
+    const first = command.split('\n')[0].trim();
+    const truncated = first.length > 80 ? first.slice(0, 77) + '...' : first;
+    return command.includes('\n') ? truncated + ' …' : truncated;
+  }
+
+  function formatPipeResult(result: PipelineResult): void {
+    const status = result.success ? '✓' : '✗';
+    process.stdout.write(`  ${status} Pipeline ${result.pipelineName} (${result.durationMs}ms)\n`);
+    for (const step of result.steps) {
+      const s = step.success ? '  ✓' : '  ✗';
+      process.stdout.write(`    ${s} [${step.type}] ${step.stdout.split('\n')[0].slice(0, 80)}\n`);
+      if (step.stderr) {
+        process.stdout.write(`      ${step.stderr.split('\n')[0]}\n`);
+      }
+    }
+  }
+
+  if (sub === 'help' || sub === '--help' || sub === '-h') {
+    process.stdout.write(`
+md-kit pipe — markdown content pipelines
+
+USAGE
+  md-kit pipe init                   scaffold a .md-pipe.yml config file
+  md-kit pipe watch                  start watching for changes
+  md-kit pipe once                   run triggers against current files (CI/batch)
+  md-kit pipe run <pipeline> [file]  manually trigger a pipeline on a file
+  md-kit pipe test <file>            show which triggers/pipelines match a file
+
+FLAGS
+  --config, -c <path>   path to config file (default: .md-pipe.yml)
+  --dry-run             show matches without executing actions
+  --json                output in JSON format
+  --verbose             show trigger + file + first line of command
+  --debug               show full interpolated commands
+  --state <path>        state file for idempotent once mode
+
+CONFIG (.md-pipe.yml)
+  watch: ./docs
+  triggers:
+    - name: publish
+      match:
+        path: "posts/**"
+        frontmatter: { status: publish }
+      run: "echo Publishing $FILE"
+  pipelines:
+    - name: publish-post
+      trigger:
+        path: "posts/**"
+        frontmatter: { status: publish }
+      steps:
+        - run: "echo Publishing {{fm.title}}"
+        - update-frontmatter: { published_at: "{{now}}" }
+`.trim() + '\n');
+    return 0;
+  }
+
+  if (sub === 'init') {
+    const target = resolve(process.cwd(), '.md-pipe.yml');
+    if (existsSync(target)) {
+      process.stderr.write('.md-pipe.yml already exists. Delete it first to re-initialize.\n');
+      return 1;
+    }
+    writeFileSync(target, generateDefaultConfig(), 'utf-8');
+    process.stdout.write('created .md-pipe.yml\nedit the config, then run: md-kit pipe watch\n');
+    return 0;
+  }
+
+  if (sub === 'watch') {
+    const config = getConfig();
+    if (!existsSync(config.watch)) {
+      process.stderr.write(`watch directory not found: ${config.watch}\n`);
+      return 1;
+    }
+
+    const watcher = new MdPipeWatcher(config, dryRun);
+
+    watcher.on('ready', () => {
+      process.stdout.write(`watching ${config.watch}\n`);
+      if (config.triggers.length > 0) process.stdout.write(`  ${config.triggers.length} trigger(s)\n`);
+      if (config.pipelines.length > 0) process.stdout.write(`  ${config.pipelines.length} pipeline(s)\n`);
+      if (dryRun) process.stdout.write('  [dry-run mode — actions will not execute]\n');
+      process.stdout.write('  press Ctrl+C to stop\n\n');
+    });
+
+    watcher.on('match', (result) => {
+      if (json) return;
+      const ts = new Date().toLocaleTimeString();
+      process.stdout.write(`[${ts}] ▸ ${result.trigger.name} matched ${result.file.relativePath}\n`);
+    });
+
+    watcher.on('action', (result) => {
+      if (json) { process.stdout.write(JSON.stringify(result) + '\n'); return; }
+      const status = result.exitCode === 0 ? '✓' : `✗ exit ${result.exitCode}`;
+      process.stdout.write(`  ${status} ${formatCmd(result.command)}\n`);
+      if (result.stdout && (verbose || debug)) {
+        process.stdout.write('    ' + result.stdout.replace(/\n/g, '\n    ') + '\n');
+      }
+      if (result.stderr) {
+        process.stdout.write('    ' + result.stderr.replace(/\n/g, '\n    ') + '\n');
+      }
+    });
+
+    watcher.on('pipeline', (result: PipelineResult) => {
+      if (json) { process.stdout.write(JSON.stringify(result) + '\n'); return; }
+      formatPipeResult(result);
+    });
+
+    watcher.on('error', (err, filePath) => {
+      process.stderr.write(`Error${filePath ? ` (${filePath})` : ''}: ${err.message}\n`);
+    });
+
+    process.on('SIGINT', async () => {
+      process.stdout.write('\nstopping watcher...\n');
+      await watcher.stop();
+      process.exit(0);
+    });
+
+    await watcher.start();
+    return 0; // won't reach until SIGINT
+  }
+
+  if (sub === 'once') {
+    const config = getConfig();
+    if (!existsSync(config.watch)) {
+      process.stderr.write(`watch directory not found: ${config.watch}\n`);
+      return 1;
+    }
+
+    const result = runOnce(config, dryRun, statePath);
+
+    if (json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+      return result.errors.length > 0 ? 1 : 0;
+    }
+
+    process.stdout.write(`md-kit pipe once\n`);
+    let summary = `  scanned ${result.total} files, ${result.matched} trigger match(es)`;
+    if (result.skipped > 0) summary += `, ${result.skipped} skipped (unchanged)`;
+    process.stdout.write(summary + '\n\n');
+
+    if (dryRun) process.stdout.write('  [dry-run mode — actions were not executed]\n\n');
+
+    for (const action of result.actions) {
+      const status = action.exitCode === 0 ? '✓' : `✗ exit ${action.exitCode}`;
+      process.stdout.write(`${status} ${action.triggerName} → ${formatCmd(action.command)}\n`);
+      if (action.stdout && (verbose || debug)) process.stdout.write('  ' + action.stdout + '\n');
+      if (action.stderr) process.stdout.write('  ' + action.stderr + '\n');
+    }
+
+    for (const err of result.errors) process.stderr.write(err + '\n');
+    return result.errors.length > 0 ? 1 : 0;
+  }
+
+  if (sub === 'run') {
+    const pipelineName = positionals[0];
+    const filePath = positionals[1];
+
+    if (!pipelineName) {
+      process.stderr.write('Usage: md-kit pipe run <pipeline-name> [file]\n');
+      return 1;
+    }
+
+    const config = getConfig();
+    const result = await runPipelineCommand(config, pipelineName, filePath, dryRun);
+
+    if (json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+      return result.success ? 0 : 1;
+    }
+
+    process.stdout.write(`md-kit pipe run ${pipelineName}${filePath ? ` ${filePath}` : ''}\n\n`);
+
+    for (const pr of result.results) {
+      formatPipeResult(pr);
+    }
+    for (const err of result.errors) process.stderr.write(err + '\n');
+
+    return result.success ? 0 : 1;
+  }
+
+  if (sub === 'test') {
+    const filePath = positionals[0];
+    if (!filePath) {
+      process.stderr.write('Usage: md-kit pipe test <file>\n');
+      return 1;
+    }
+
+    const config = getConfig();
+    let result;
+    try {
+      result = testFile(config, filePath);
+    } catch (e: any) {
+      process.stderr.write(`Error: ${e.message}\n`);
+      return 1;
+    }
+
+    if (json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+      return 0;
+    }
+
+    process.stdout.write(`testing: ${result.relativePath}\n`);
+    process.stdout.write(`  frontmatter: ${JSON.stringify(result.frontmatter)}\n`);
+    process.stdout.write(`  tags: [${result.tags.join(', ')}]\n\n`);
+
+    if (result.matches.length === 0) {
+      process.stdout.write('  no triggers or pipelines matched this file.\n');
+      return 0;
+    }
+
+    for (const m of result.matches) {
+      const label = m.type === 'pipeline' ? '[pipeline]' : '[trigger]';
+      process.stdout.write(`  ✓ ${label} ${m.triggerName}: ${m.reason}\n`);
+    }
+
+    return 0;
+  }
+
+  process.stderr.write(`unknown pipe subcommand: ${sub}\nRun md-kit pipe --help for usage.\n`);
+  return 1;
+}
+
 export function main(argv: string[] = process.argv): number {
   const opts = parseArgs(argv);
 
@@ -628,6 +901,11 @@ export function main(argv: string[] = process.argv): number {
 
   if (opts.command === 'watch') {
     return cmdWatch(opts);
+  }
+
+  if (opts.command === 'pipe') {
+    // pipe is async — must be handled via runAsync
+    return -999; // sentinel: handled by runAsync
   }
 
   if (opts.command !== 'check') {
@@ -687,5 +965,19 @@ export function main(argv: string[] = process.argv): number {
 }
 
 // Run
-const exitCode = main();
-if (exitCode !== 0) process.exit(exitCode);
+async function runAsync(): Promise<void> {
+  const opts = parseArgs(process.argv);
+  if (opts.command === 'pipe') {
+    const subArgs = process.argv.slice(3); // everything after 'pipe'
+    const code = await cmdPipe(subArgs);
+    if (code !== 0) process.exit(code);
+    return;
+  }
+  const exitCode = main();
+  if (exitCode !== 0) process.exit(exitCode);
+}
+
+runAsync().catch(err => {
+  process.stderr.write(`Error: ${err.message}\n`);
+  process.exit(1);
+});

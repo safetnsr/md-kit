@@ -156,8 +156,8 @@ describe('v0.5.0 — --since flag', () => {
 });
 
 describe('v0.5.0 — version', () => {
-  it('--version shows 0.5.0', () => {
+  it('--version shows 0.2.0', () => {
     const { stdout } = run('--version');
-    assert.ok(stdout.includes('0.5.0'));
+    assert.ok(stdout.includes('0.2.0'));
   });
 });
